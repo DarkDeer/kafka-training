@@ -14,6 +14,7 @@ import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.kstream.KGroupedStream;
+import org.apache.kafka.streams.kstream.KGroupedTable;
 import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.KTable;
 import org.apache.kafka.streams.kstream.Materialized;
@@ -24,6 +25,7 @@ import org.apache.kafka.streams.kstream.TimeWindows;
 import org.apache.kafka.streams.kstream.Windowed;
 import org.apache.kafka.streams.kstream.internals.WindowedDeserializer;
 import org.apache.kafka.streams.kstream.internals.WindowedSerializer;
+import org.apache.kafka.streams.state.KeyValueStore;
 import org.apache.kafka.streams.state.WindowStore;
 
 import com.fasterxml.jackson.databind.type.TypeFactory;
@@ -39,6 +41,7 @@ public class TopUserScores {
 
 	public static final String USER_SCORE_STREAM_NAME = "user-scores";
 	public static final String TOP_GAME_USERS_STREAM_NAME = "top-game-users";
+	public static final int TIME_WINDOW_SECONDS = 30;
 
 	public static Topology createTopology() {
 
@@ -52,7 +55,7 @@ public class TopUserScores {
 		KGroupedStream<UserGame, Long> groupedUserScores = 
 				userScores.groupByKey(Serialized.with(userGameSerde, longSerde));
 		// count the scores per hour, using tumbling windows with a size of one hour
-		TimeWindowedKStream<UserGame, Long> hourGroupedUserScores = groupedUserScores.windowedBy(TimeWindows.of(60 * 60 * 1000L));
+		TimeWindowedKStream<UserGame, Long> hourGroupedUserScores = groupedUserScores.windowedBy(TimeWindows.of(TIME_WINDOW_SECONDS * 1000L));
 		KTable<Windowed<UserGame>, Long> aggregatedUserScores = hourGroupedUserScores.aggregate(
 				() -> 0L, 
 				(userGame, score, scoreSum) -> scoreSum + score,
@@ -66,8 +69,7 @@ public class TopUserScores {
 				new WindowedDeserializer<>(stringSerde.deserializer())); 
 		final Serde<PriorityQueue<GameScore>> userScoreQueueSerde = 
 				new JsonSerde<PriorityQueue<GameScore>>(jsonTypeFactory.constructParametricType(PriorityQueue.class, GameScore.class)); 
-		KTable<Windowed<String>, PriorityQueue<GameScore>> allUserScores = aggregatedUserScores 
-				.groupBy( 
+		KGroupedTable<Windowed<String>, GameScore> aggregatedUserScoresGroupedByGame = aggregatedUserScores.groupBy(
 						// the selector 
 						(windowedUserGame, score) -> { 
 							// project on the game for key 
@@ -77,8 +79,8 @@ public class TopUserScores {
 							GameScore value = new GameScore(windowedUserGame.key().user, score); 
 							return new KeyValue<>(windowedGame, value); 
 						}, 
-						Serialized.with(windowedStringSerde, gameScoreSerde) 
-						).aggregate( 
+						Serialized.with(windowedStringSerde, gameScoreSerde));
+		KTable<Windowed<String>, PriorityQueue<GameScore>> allUserScores = aggregatedUserScoresGroupedByGame.aggregate( 
 								// the initializer 
 								() -> { 
 									Comparator<GameScore> comparator = 
@@ -88,20 +90,17 @@ public class TopUserScores {
 											});
 											return new PriorityQueue<>(comparator); 
 								}, 
-
-
 								// the "add" aggregator 
 								(windowedGame, record, queue) -> { 
 									queue.add(record); 
 									return queue; 
 								}, 
-
 								// the "remove" aggregator 
 								(windowedGame, record, queue) -> { 
 									queue.remove(record); 
 									return queue; 
 								}, 
-								Materialized.as("AllUserScores")/*.withValueSerde(userScoreQueueSerde)*/ 
+								Materialized.<Windowed<String>, PriorityQueue<GameScore>, KeyValueStore<Bytes, byte[]>>as("AllUserScores").withValueSerde(userScoreQueueSerde) 
 								); 
 
 		int topN = 5; 
